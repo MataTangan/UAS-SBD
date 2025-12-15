@@ -1,0 +1,294 @@
+<?php
+session_start();
+require_once 'config/database.php';
+
+if (!isset($_SESSION['user_id']) || $_SESSION['user_type'] != 'camaba') {
+    header("Location: login.php");
+    exit();
+}
+
+$database = new Database();
+$db = $database->getConnection();
+$id_camaba = $_SESSION['user_id'];
+
+// Get ID pendaftaran from URL or get latest
+if (isset($_GET['id_pendaftaran'])) {
+    $id_pendaftaran = $_GET['id_pendaftaran'];
+} else {
+    // Get latest pendaftaran
+    $query = "SELECT id_pendaftaran FROM pendaftaran WHERE id_camaba = ? ORDER BY tanggal_daftar DESC LIMIT 1";
+    $stmt = $db->prepare($query);
+    $stmt->execute([$id_camaba]);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$result) {
+        header("Location: camaba_daftar_prodi.php");
+        exit();
+    }
+    $id_pendaftaran = $result['id_pendaftaran'];
+}
+
+// Get pendaftaran data
+$query = "SELECT p.*, pr.nama_prodi, f.nama_fakultas, c.nama_lengkap
+          FROM pendaftaran p
+          JOIN prodi pr ON p.id_prodi = pr.id_prodi
+          JOIN fakultas f ON pr.id_fakultas = f.id_fakultas
+          JOIN camaba c ON p.id_camaba = c.id_camaba
+          WHERE p.id_pendaftaran = ? AND p.id_camaba = ?";
+$stmt = $db->prepare($query);
+$stmt->execute([$id_pendaftaran, $id_camaba]);
+$pendaftaran = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if (!$pendaftaran) {
+    header("Location: camaba_dashboard.php");
+    exit();
+}
+
+// Check if berkas already exists
+$query_berkas = "SELECT * FROM berkas WHERE id_pendaftaran = ?";
+$stmt_berkas = $db->prepare($query_berkas);
+$stmt_berkas->execute([$id_pendaftaran]);
+$existing_berkas = $stmt_berkas->fetch(PDO::FETCH_ASSOC);
+
+// Process upload
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $upload_dir = "uploads/berkas/";
+    if (!file_exists($upload_dir)) {
+        mkdir($upload_dir, 0777, true);
+    }
+    
+    $files = [
+        'ijazah' => $existing_berkas['ijazah'] ?? '',
+        'kk' => $existing_berkas['kk'] ?? '',
+        'foto' => $existing_berkas['foto'] ?? '',
+        'akta_kelahiran' => $existing_berkas['akta_kelahiran'] ?? '',
+        'surat_keterangan_lulus' => $existing_berkas['surat_keterangan_lulus'] ?? '',
+        'sertifikat_prestasi' => $existing_berkas['sertifikat_prestasi'] ?? ''
+    ];
+    
+    $allowed_types = ['pdf', 'jpg', 'jpeg', 'png'];
+    $max_size = 2 * 1024 * 1024;
+    $upload_success = true;
+    $error_message = "";
+    
+    foreach ($files as $field => $old_file) {
+        if (isset($_FILES[$field]) && $_FILES[$field]['error'] == 0) {
+            $file_ext = strtolower(pathinfo($_FILES[$field]['name'], PATHINFO_EXTENSION));
+            
+            if (!in_array($file_ext, $allowed_types)) {
+                $upload_success = false;
+                $error_message = "File $field harus PDF, JPG, atau PNG";
+                break;
+            }
+            
+            if ($_FILES[$field]['size'] > $max_size) {
+                $upload_success = false;
+                $error_message = "Ukuran file $field maksimal 2MB";
+                break;
+            }
+            
+            if ($old_file && file_exists($upload_dir . $old_file)) {
+                unlink($upload_dir . $old_file);
+            }
+            
+            $new_filename = $id_pendaftaran . "_" . $field . "_" . time() . "." . $file_ext;
+            $target_file = $upload_dir . $new_filename;
+            
+            if (move_uploaded_file($_FILES[$field]['tmp_name'], $target_file)) {
+                $files[$field] = $new_filename;
+            } else {
+                $upload_success = false;
+                $error_message = "Gagal upload file $field";
+                break;
+            }
+        }
+    }
+    
+    if ($upload_success) {
+        try {
+            if ($existing_berkas) {
+                // Update
+                $query = "UPDATE berkas SET 
+                          ijazah = :ijazah, kk = :kk, foto = :foto,
+                          akta_kelahiran = :akta_kelahiran,
+                          surat_keterangan_lulus = :surat_keterangan_lulus,
+                          sertifikat_prestasi = :sertifikat_prestasi,
+                          status_berkas = 'Menunggu Verifikasi',
+                          catatan_berkas = :catatan,
+                          tanggal_upload = CURRENT_TIMESTAMP
+                          WHERE id_pendaftaran = :id_pendaftaran";
+            } else {
+                // Insert
+                $query = "INSERT INTO berkas 
+                          (id_pendaftaran, ijazah, kk, foto, akta_kelahiran,
+                           surat_keterangan_lulus, sertifikat_prestasi, 
+                           status_berkas, catatan_berkas) 
+                          VALUES 
+                          (:id_pendaftaran, :ijazah, :kk, :foto, :akta_kelahiran,
+                           :surat_keterangan_lulus, :sertifikat_prestasi,
+                           'Menunggu Verifikasi', :catatan)";
+            }
+            
+            $stmt = $db->prepare($query);
+            $stmt->bindParam(':id_pendaftaran', $id_pendaftaran);
+            $stmt->bindParam(':ijazah', $files['ijazah']);
+            $stmt->bindParam(':kk', $files['kk']);
+            $stmt->bindParam(':foto', $files['foto']);
+            $stmt->bindParam(':akta_kelahiran', $files['akta_kelahiran']);
+            $stmt->bindParam(':surat_keterangan_lulus', $files['surat_keterangan_lulus']);
+            $stmt->bindParam(':sertifikat_prestasi', $files['sertifikat_prestasi']);
+            $stmt->bindParam(':catatan', $_POST['catatan_berkas']);
+            
+            if ($stmt->execute()) {
+                echo "<script>
+                    Swal.fire({
+                        icon: 'success',
+                        title: 'Berhasil!',
+                        text: 'Berkas berhasil diupload dan menunggu verifikasi',
+                        confirmButtonColor: '#667eea'
+                    }).then(() => {
+                        window.location.href = 'camaba_dashboard.php';
+                    });
+                </script>";
+            }
+        } catch (PDOException $e) {
+            $error_message = "Error: " . $e->getMessage();
+        }
+    }
+    
+    if (!$upload_success) {
+        echo "<script>
+            Swal.fire({
+                icon: 'error',
+                title: 'Upload Gagal!',
+                text: '$error_message'
+            });
+        </script>";
+    }
+}
+
+include 'includes/header_camaba.php';
+?>
+
+<div class="container py-4">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb">
+            <li class="breadcrumb-item"><a href="camaba_dashboard.php">Dashboard</a></li>
+            <li class="breadcrumb-item active">Upload Berkas</li>
+        </ol>
+    </nav>
+
+    <!-- Info Pendaftaran -->
+    <div class="card mb-4 border-primary">
+        <div class="card-header bg-primary text-white">
+            <h5 class="mb-0"><i class="bi bi-info-circle me-2"></i>Informasi Pendaftaran</h5>
+        </div>
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-3">
+                    <strong>No. Pendaftaran:</strong><br>
+                    <h5 class="text-primary"><?php echo htmlspecialchars($pendaftaran['no_pendaftaran']); ?></h5>
+                </div>
+                <div class="col-md-3">
+                    <strong>Nama:</strong><br>
+                    <?php echo htmlspecialchars($pendaftaran['nama_lengkap']); ?>
+                </div>
+                <div class="col-md-3">
+                    <strong>Program Studi:</strong><br>
+                    <?php echo htmlspecialchars($pendaftaran['nama_prodi']); ?>
+                </div>
+                <div class="col-md-3">
+                    <strong>Status:</strong><br>
+                    <span class="badge bg-info"><?php echo $pendaftaran['status_pendaftaran']; ?></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Form Upload -->
+    <div class="card">
+        <div class="card-header bg-white">
+            <h4 class="mb-0"><i class="bi bi-cloud-upload me-2"></i>Upload Berkas Pendaftaran</h4>
+        </div>
+        <div class="card-body">
+            <div class="alert alert-info">
+                <i class="bi bi-info-circle me-2"></i>
+                <strong>Ketentuan Upload:</strong>
+                <ul class="mb-0 mt-2">
+                    <li>Format file: PDF, JPG, JPEG, atau PNG</li>
+                    <li>Maksimal ukuran: 2MB per file</li>
+                    <li>File yang <strong>WAJIB</strong>: Ijazah/STTB, KK, dan Pas Foto</li>
+                    <li>File lainnya bersifat opsional</li>
+                </ul>
+            </div>
+
+            <form method="POST" action="" enctype="multipart/form-data">
+                <div class="row g-3">
+                    <?php
+                    $files_list = [
+                        'ijazah' => ['label' => 'Ijazah/STTB', 'required' => !$existing_berkas, 'icon' => 'file-earmark-text', 'desc' => 'Scan ijazah atau STTB terakhir'],
+                        'kk' => ['label' => 'Kartu Keluarga (KK)', 'required' => !$existing_berkas, 'icon' => 'people', 'desc' => 'Scan kartu keluarga'],
+                        'foto' => ['label' => 'Pas Foto 3x4', 'required' => !$existing_berkas, 'icon' => 'person-square', 'desc' => 'Foto formal background merah/biru'],
+                        'akta_kelahiran' => ['label' => 'Akta Kelahiran', 'required' => false, 'icon' => 'file-earmark-medical', 'desc' => 'Scan akta kelahiran (opsional)'],
+                        'surat_keterangan_lulus' => ['label' => 'Surat Keterangan Lulus', 'required' => false, 'icon' => 'file-earmark-check', 'desc' => 'Untuk siswa kelas 12 (opsional)'],
+                        'sertifikat_prestasi' => ['label' => 'Sertifikat Prestasi', 'required' => false, 'icon' => 'award', 'desc' => 'Sertifikat prestasi jika ada (opsional)']
+                    ];
+                    
+                    foreach ($files_list as $field => $info):
+                    ?>
+                    <div class="col-md-6">
+                        <div class="card h-100">
+                            <div class="card-body">
+                                <label class="form-label">
+                                    <i class="bi bi-<?php echo $info['icon']; ?> me-2"></i>
+                                    <strong><?php echo $info['label']; ?></strong>
+                                    <?php if ($info['required']): ?>
+                                        <span class="text-danger">*</span>
+                                    <?php endif; ?>
+                                </label>
+                                
+                                <?php if ($existing_berkas && $existing_berkas[$field]): ?>
+                                <div class="alert alert-success py-2 mb-2">
+                                    <i class="bi bi-check-circle me-1"></i>
+                                    <small>File sudah diupload: <strong><?php echo $existing_berkas[$field]; ?></strong></small>
+                                </div>
+                                <?php endif; ?>
+                                
+                                <input type="file" name="<?php echo $field; ?>" 
+                                       class="form-control mb-2" 
+                                       accept=".pdf,.jpg,.jpeg,.png"
+                                       <?php echo $info['required'] ? 'required' : ''; ?>>
+                                <small class="text-muted">
+                                    <i class="bi bi-info-circle me-1"></i><?php echo $info['desc']; ?>
+                                </small>
+                            </div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+
+                    <div class="col-md-12">
+                        <label class="form-label"><strong>Catatan (Opsional)</strong></label>
+                        <textarea name="catatan_berkas" class="form-control" rows="3" 
+                                  placeholder="Catatan tambahan jika diperlukan..."><?php echo $existing_berkas ? htmlspecialchars($existing_berkas['catatan_berkas']) : ''; ?></textarea>
+                    </div>
+                </div>
+
+                <hr class="my-4">
+
+                <div class="d-flex justify-content-between">
+                    <a href="camaba_dashboard.php" class="btn btn-secondary">
+                        <i class="bi bi-arrow-left me-2"></i>Kembali ke Dashboard
+                    </a>
+                    <button type="submit" class="btn btn-primary btn-lg">
+                        <i class="bi bi-cloud-upload me-2"></i>
+                        <?php echo $existing_berkas ? 'Update Berkas' : 'Upload Berkas'; ?>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+<?php include 'includes/footer.php'; ?>
+
